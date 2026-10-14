@@ -7,9 +7,11 @@ import {
   remoteExecutors
 } from '@imgly/codesign-sdk';
 import { Agent } from '@mastra/core/agent';
+import { Mastra } from '@mastra/core/mastra';
 import { createTool } from '@mastra/core/tools';
 
 const brief = process.argv[2];
+const task = `${brief}\n\nDesign this and reply once it is done. No one can answer questions during this run.`;
 const missing = [
   ...(brief ? [] : ['a brief (the first argument)']),
   ...['IMGLY_CESDK_LICENSE', 'EXECUTOR_TOKEN'].filter((n) => !process.env[n])
@@ -68,17 +70,26 @@ const tools = Object.fromEntries(
         if (result.isError) throw new Error(textOf(result.content)); // the model reads it as a failed call
         return result.content;
       },
-      // Renders go to the model as images, not as text.
+      // Renders go to the model as images, not as text. A call whose arguments
+      // fail the schema never runs: Mastra hands over its { error, message }.
       toModelOutput: (output) => ({
         type: 'content',
-        value:
-          /** @type {import('@imgly/codesign-sdk').ToolResult['content']} */ (
-            output
-          ).map((p) =>
-            p.type === 'text'
-              ? { type: 'text', text: p.text }
-              : { type: 'media', mediaType: p.mimeType, data: p.data }
-          )
+        value: Array.isArray(output)
+          ? /** @type {import('@imgly/codesign-sdk').ToolResult['content']} */ (
+              output
+            ).map((p) =>
+              p.type === 'text'
+                ? { type: 'text', text: p.text }
+                : { type: 'media', mediaType: p.mimeType, data: p.data }
+            )
+          : [
+              {
+                type: 'text',
+                text:
+                  /** @type {{ message?: string }} */ (output).message ??
+                  JSON.stringify(output)
+              }
+            ]
       })
     })
   ])
@@ -152,7 +163,7 @@ const imagesAfterToolResults = {
   }
 };
 
-const agent = new Agent({
+const designer = new Agent({
   id: 'designer',
   name: 'Designer',
   instructions: `You design marketing visuals. When you are done, say in one sentence what you made.\n\n${codesign.instructions}`,
@@ -166,10 +177,21 @@ const agent = new Agent({
   tools,
   inputProcessors: [imagesAfterToolResults]
 });
+// logger: false, or Mastra logs a failed model call as a 50-line object; the run's one-line cause below says enough.
+const mastra = new Mastra({ agents: { designer }, logger: false });
+const agent = mastra.getAgent('designer');
 
 /** A failure in one line: the SDK error's kind and the first line of its message, not a stack or a request body. */
 const cause = (err) =>
   `${err?.kind ? `${err.kind}: ` : ''}${String(err instanceof Error ? err.message : err).split('\n')[0]}`;
+
+/** How many blocks the pages hold, read with a free edit: none when the model only asked a question. */
+const blocksOnPages = async () =>
+  (
+    await codesign.edit(`let n = 0;
+for (const page of await engine.design.findByType('page')) n += (await engine.design.getChildren(page)).length;
+return n;`)
+  ).value;
 
 // The free .imgly first: when the billed PNG export fails, or the run ends early, the design the model made is kept.
 async function save(withPNG) {
@@ -178,6 +200,13 @@ async function save(withPNG) {
     await mkdir('out', { recursive: true });
     await writeFile(file, await codesign.export('imgly'));
     if (!withPNG) return console.error(`Wrote ${file}, the design so far.`);
+    if ((await blocksOnPages()) === 0) {
+      console.error(
+        'The page has no blocks, so no PNG was exported (each export is charged). If the model asked a question, put the answer into the brief, and run again.'
+      );
+      process.exitCode = 1;
+      return;
+    }
     file = 'out/design.png';
     await writeFile(file, await codesign.export('png'));
     console.log('Wrote out/design.png and out/design.imgly');
@@ -189,7 +218,7 @@ async function save(withPNG) {
 
 const started = Date.now();
 try {
-  const run = await agent.generate(brief, { maxSteps: 60 });
+  const run = await agent.generate(task, { maxSteps: 60 });
   console.log(`\n${run.steps.at(-1)?.text ?? run.text}`); // run.text joins every step's text
   const { inputTokens, outputTokens } = run.totalUsage ?? {};
   console.log(
